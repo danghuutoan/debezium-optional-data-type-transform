@@ -16,6 +16,7 @@ import org.apache.kafka.connect.data.Schema;
 import org.apache.kafka.connect.data.SchemaBuilder;
 import org.apache.kafka.connect.data.Struct;
 import org.apache.kafka.connect.data.Timestamp;
+import org.apache.kafka.connect.data.Date;
 import org.apache.kafka.connect.source.SourceRecord;
 import org.junit.Test;
 
@@ -23,24 +24,21 @@ import io.debezium.data.Envelope;
 
 import java.text.ParseException;
 import java.text.SimpleDateFormat;  
-import java.util.Date;
 /**
  * @author Jiri Pechanec
  */
 public class SetDataTypeToOptionalTests {
 
-    private static final String DROP_TOMBSTONES = "drop.tombstones";
     private static final String HANDLE_DELETES = "delete.handling.mode";
-    private static final String ROUTE_BY_FIELD = "route.by.field";
-    private static final String ADD_FIELDS = "add.fields";
     private static final String ADD_HEADERS = "add.headers";
-    private static final String ADD_FIELDS_PREFIX = ADD_FIELDS + ".prefix";
-    private static final String ADD_HEADERS_PREFIX = ADD_HEADERS + ".prefix";
+    private static final String TIMESTAMP_TEST_FIELD_NAME = "timeStampField";
+    private static final String DATE_TEST_FIELD_NAME = "dateField";   
 
     final Schema recordSchema = SchemaBuilder.struct()
             .field("id", Schema.INT8_SCHEMA)
             .field("name", Schema.STRING_SCHEMA)
-            .field("createAt", Timestamp.builder())
+            .field(TIMESTAMP_TEST_FIELD_NAME, Timestamp.builder())
+            .field(DATE_TEST_FIELD_NAME, Date.builder())
             .build();
 
     final Schema sourceSchema = SchemaBuilder.struct()
@@ -80,10 +78,10 @@ public class SetDataTypeToOptionalTests {
     private SourceRecord createCreateRecord() throws ParseException {
         final Struct after = new Struct(recordSchema);
         final Struct source = new Struct(sourceSchema);
-        Date create_at = new SimpleDateFormat("dd/MM/yyyy").parse("20/02/1992");
         after.put("id", (byte) 1);
         after.put("name", "myRecord");
-        after.put("createAt", create_at);
+        after.put(TIMESTAMP_TEST_FIELD_NAME, new SimpleDateFormat("dd/MM/yyyy").parse("20/02/1992"));
+        after.put(DATE_TEST_FIELD_NAME, new SimpleDateFormat("dd/MM/yyyy").parse("20/02/1992"));
         source.put("lsn", 1234);
         source.put("ts_ms", 12836);
         final Struct payload = envelope.create(after, source, Instant.now());
@@ -110,7 +108,7 @@ public class SetDataTypeToOptionalTests {
     // }
 
     @Test
-    public void testHandleCreateRewrite() throws ParseException {
+    public void testShouldSupportTimestampType() throws ParseException {
         try (final SetDataTypeToOptional<SourceRecord> transform = new SetDataTypeToOptional<>()) {
             final Map<String, String> props = new HashMap<>();
             props.put(HANDLE_DELETES, "rewrite");
@@ -120,8 +118,24 @@ public class SetDataTypeToOptionalTests {
             final SourceRecord createRecord = createCreateRecord();
             final SourceRecord unwrapped = transform.apply(createRecord);
             Field afterField = unwrapped.valueSchema().field("after");
-            assertThat(afterField.schema().field("createAt").schema().isOptional()).isEqualTo(true);
-            assertThat(afterField.schema().field("createAt").schema().defaultValue()).isEqualTo(null);
+            assertThat(afterField.schema().field(TIMESTAMP_TEST_FIELD_NAME).schema().isOptional()).isEqualTo(true);
+            assertThat(afterField.schema().field(TIMESTAMP_TEST_FIELD_NAME).schema().defaultValue()).isEqualTo(null);
+        }
+    }
+
+    @Test
+    public void testShouldSupportDateType() throws ParseException {
+        try (final SetDataTypeToOptional<SourceRecord> transform = new SetDataTypeToOptional<>()) {
+            final Map<String, String> props = new HashMap<>();
+            props.put(HANDLE_DELETES, "rewrite");
+            props.put(ADD_HEADERS, "op");
+            transform.configure(props);
+
+            final SourceRecord createRecord = createCreateRecord();
+            final SourceRecord unwrapped = transform.apply(createRecord);
+            Field afterField = unwrapped.valueSchema().field("after");
+            assertThat(afterField.schema().field(DATE_TEST_FIELD_NAME).schema().isOptional()).isEqualTo(true);
+            assertThat(afterField.schema().field(DATE_TEST_FIELD_NAME).schema().defaultValue()).isEqualTo(null);
         }
     }
 }
