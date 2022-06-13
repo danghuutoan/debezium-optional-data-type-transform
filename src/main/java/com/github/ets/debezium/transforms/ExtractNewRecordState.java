@@ -3,7 +3,7 @@
  *
  * Licensed under the Apache Software License version 2.0, available at http://www.apache.org/licenses/LICENSE-2.0
  */
-package com.github.danghuutoan.debezium.transformations;
+package com.github.ets.debezium.transforms;
 
 import static org.apache.kafka.connect.transforms.util.Requirements.requireStruct;
 
@@ -15,8 +15,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
-
-import javax.management.relation.Relation;
 
 import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.connect.connector.ConnectRecord;
@@ -46,39 +44,29 @@ import io.debezium.transforms.SmtManager;
 import io.debezium.transforms.ExtractNewRecordStateConfigDefinition.DeleteHandling;
 import io.debezium.util.BoundedConcurrentHashMap;
 import io.debezium.util.Strings;
-import org.apache.kafka.connect.errors.DataException;
 
 /**
- * Debezium generates CDC (<code>Envelope</code>) records that are struct of
- * values containing values
- * <code>before</code> and <code>after change</code>. Sink connectors usually
- * are not able to work
- * with a complex structure so a user use this SMT to extract <code>after</code>
- * value and send it down
+ * Debezium generates CDC (<code>Envelope</code>) records that are struct of values containing values
+ * <code>before</code> and <code>after change</code>. Sink connectors usually are not able to work
+ * with a complex structure so a user use this SMT to extract <code>after</code> value and send it down
  * unwrapped in <code>Envelope</code>.
  * <p>
- * The functionality is similar to <code>ExtractField</code> SMT but has a
- * special semantics for handling
- * delete events; when delete event is emitted by database then Debezium emits
- * two messages: a delete
- * message and a tombstone message that serves as a signal to Kafka compaction
- * process.
+ * The functionality is similar to <code>ExtractField</code> SMT but has a special semantics for handling
+ * delete events; when delete event is emitted by database then Debezium emits two messages: a delete
+ * message and a tombstone message that serves as a signal to Kafka compaction process.
  * <p>
- * The SMT by default drops the tombstone message created by Debezium and
- * converts the delete message into
+ * The SMT by default drops the tombstone message created by Debezium and converts the delete message into
  * a tombstone message that can be dropped, too, if required.
  * <p>
- * The SMT also has the option to insert fields from the original record (e.g.
- * 'op' or 'source.ts_ms' into the
+ * The SMT also has the option to insert fields from the original record (e.g. 'op' or 'source.ts_ms' into the
  * unwrapped record or ad them as header attributes.
  *
- * @param <R> the subtype of {@link ConnectRecord} on which this transformation
- *            will operate
+ * @param <R> the subtype of {@link ConnectRecord} on which this transformation will operate
  * @author Jiri Pechanec
  */
-public class SetDataTypeToOptional<R extends ConnectRecord<R>> implements Transformation<R> {
+public class ExtractNewRecordState<R extends ConnectRecord<R>> implements Transformation<R> {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(SetDataTypeToOptional.class);
+    private static final Logger LOGGER = LoggerFactory.getLogger(ExtractNewRecordState.class);
 
     private static final String PURPOSE = "source field insertion";
     private static final int SCHEMA_CACHE_SIZE = 64;
@@ -102,8 +90,7 @@ public class SetDataTypeToOptional<R extends ConnectRecord<R>> implements Transf
         final Configuration config = Configuration.from(configs);
         smtManager = new SmtManager<>(config);
 
-        final Field.Set configFields = Field.setOf(ExtractNewRecordStateConfigDefinition.DROP_TOMBSTONES,
-                ExtractNewRecordStateConfigDefinition.HANDLE_DELETES);
+        final Field.Set configFields = Field.setOf(ExtractNewRecordStateConfigDefinition.DROP_TOMBSTONES, ExtractNewRecordStateConfigDefinition.HANDLE_DELETES);
         if (!config.validateAndRecord(configFields, LOGGER::error)) {
             throw new ConnectException("Unable to validate config.");
         }
@@ -113,10 +100,8 @@ public class SetDataTypeToOptional<R extends ConnectRecord<R>> implements Transf
 
         String addFieldsPrefix = config.getString(ExtractNewRecordStateConfigDefinition.ADD_FIELDS_PREFIX);
         String addHeadersPrefix = config.getString(ExtractNewRecordStateConfigDefinition.ADD_HEADERS_PREFIX);
-        additionalFields = FieldReference.fromConfiguration(addFieldsPrefix,
-                config.getString(ExtractNewRecordStateConfigDefinition.ADD_FIELDS));
-        additionalHeaders = FieldReference.fromConfiguration(addHeadersPrefix,
-                config.getString(ExtractNewRecordStateConfigDefinition.ADD_HEADERS));
+        additionalFields = FieldReference.fromConfiguration(addFieldsPrefix, config.getString(ExtractNewRecordStateConfigDefinition.ADD_FIELDS));
+        additionalHeaders = FieldReference.fromConfiguration(addHeadersPrefix, config.getString(ExtractNewRecordStateConfigDefinition.ADD_HEADERS));
 
         String routeFieldConfig = config.getString(ExtractNewRecordStateConfigDefinition.ROUTE_BY_FIELD);
         routeByField = routeFieldConfig.isEmpty() ? null : routeFieldConfig;
@@ -144,33 +129,69 @@ public class SetDataTypeToOptional<R extends ConnectRecord<R>> implements Transf
 
     @Override
     public R apply(final R record) {
-        if (record.value() != null) {
-            final Struct originalValue = requireStruct(record.value(), PURPOSE);
-            Schema updatedSchema = schemaUpdateCache.computeIfAbsent(originalValue.schema(),
-                    s -> makeUpdatedSchema(originalValue.schema(), originalValue));
-
-            Struct updatedValue = new Struct(updatedSchema);
-            for (org.apache.kafka.connect.data.Field field : originalValue.schema().fields()) {
-                if (field.name() == "after") {
-                    Struct updatedAfterValue = new Struct(field.schema());
-                    Struct originalAfterValue = (Struct) originalValue.get(field.name());
-                    for (org.apache.kafka.connect.data.Field afterField : field.schema().fields()) {
-                        updatedAfterValue.put(afterField.name(), originalAfterValue.get(afterField.name()));
-                    }
-                    originalValue.put(field.name(), updatedAfterValue);
-                } else {
-
-                    if (originalValue.get(field.name()) != null)
-                        updatedValue.put(field.name(), originalValue.get(field.name()));
-
-                }
-
+        if (record.value() == null) {
+            if (dropTombstones) {
+                LOGGER.trace("Tombstone {} arrived and requested to be dropped", record.key());
+                return null;
             }
-            return record.newRecord(record.topic(), record.kafkaPartition(), record.keySchema(), record.key(),
-                    updatedSchema, updatedValue, record.timestamp());
+            if (!additionalHeaders.isEmpty()) {
+                Headers headersToAdd = makeHeaders(additionalHeaders, (Struct) record.value());
+                headersToAdd.forEach(h -> record.headers().add(h));
+            }
+            return record;
         }
 
-        return record;
+        if (!smtManager.isValidEnvelope(record)) {
+            return record;
+        }
+
+        if (!additionalHeaders.isEmpty()) {
+            Headers headersToAdd = makeHeaders(additionalHeaders, (Struct) record.value());
+            headersToAdd.forEach(h -> record.headers().add(h));
+        }
+
+        R newRecord = afterDelegate.apply(record);
+        if (newRecord.value() == null) {
+            if (routeByField != null) {
+                Struct recordValue = requireStruct(record.value(), "Read record to set topic routing for DELETE");
+                String newTopicName = recordValue.getStruct("before").getString(routeByField);
+                newRecord = setTopic(newTopicName, newRecord);
+            }
+
+            // Handling delete records
+            switch (handleDeletes) {
+                case DROP:
+                    LOGGER.trace("Delete message {} requested to be dropped", record.key());
+                    return null;
+                case REWRITE:
+                    LOGGER.trace("Delete message {} requested to be rewritten", record.key());
+                    R oldRecord = beforeDelegate.apply(record);
+                    oldRecord = addFields(additionalFields, record, oldRecord);
+
+                    return removedDelegate.apply(oldRecord);
+                default:
+                    return newRecord;
+            }
+        }
+        else {
+            // Add on any requested source fields from the original record to the new unwrapped record
+            if (routeByField != null) {
+                Struct recordValue = requireStruct(newRecord.value(), "Read record to set topic routing for CREATE / UPDATE");
+                String newTopicName = recordValue.getString(routeByField);
+                newRecord = setTopic(newTopicName, newRecord);
+            }
+
+            newRecord = addFields(additionalFields, record, newRecord);
+
+            // Handling insert and update records
+            switch (handleDeletes) {
+                case REWRITE:
+                    LOGGER.trace("Insert/update message {} requested to be rewritten", record.key());
+                    return updatedDelegate.apply(newRecord);
+                default:
+                    return newRecord;
+            }
+        }
     }
 
     private R setTopic(String updatedTopicValue, R record) {
@@ -212,12 +233,15 @@ public class SetDataTypeToOptional<R extends ConnectRecord<R>> implements Transf
         Struct originalRecordValue = (Struct) originalRecord.value();
 
         Schema updatedSchema = schemaUpdateCache.computeIfAbsent(value.schema(),
-                s -> makeUpdatedSchema(value.schema(), originalRecordValue));
+                s -> makeUpdatedSchema(additionalFields, value.schema(), originalRecordValue));
 
         // Update the value with the new fields
         Struct updatedValue = new Struct(updatedSchema);
         for (org.apache.kafka.connect.data.Field field : value.schema().fields()) {
-            updatedValue.put(field.name(), value.get(field));
+            // We use getWithoutDefault method (instead of get) to get the raw value of the field
+            // Using get method may perform unwanted manipulation for the value (e.g: replacing null value with default value)
+            updatedValue.put(field.name(), value.getWithoutDefault(field.name()));
+
         }
 
         for (FieldReference fieldReference : additionalFields) {
@@ -234,37 +258,34 @@ public class SetDataTypeToOptional<R extends ConnectRecord<R>> implements Transf
                 unwrappedRecord.timestamp());
     }
 
-    private Schema makeUpdatedSchema(Schema schema, Struct originalRecordValue) {
+    private Schema makeUpdatedSchema(List<FieldReference> additionalFields, Schema schema, Struct originalRecordValue) {
         // Get fields from original schema
         SchemaBuilder builder = SchemaUtil.copySchemaBasics(schema, SchemaBuilder.struct());
+        // for (org.apache.kafka.connect.data.Field field : schema.fields()) {
+        //     builder.field(field.name(), field.schema());
+        // }
         for (org.apache.kafka.connect.data.Field field : schema.fields()) {
-            if (field.name().equals("after")) {
-                Schema afterSchema = field.schema();
-                SchemaBuilder afterSchemaBuilder = SchemaUtil.copySchemaBasics(afterSchema, SchemaBuilder.struct());
-                for (org.apache.kafka.connect.data.Field afterField : afterSchema.fields()) {
-                    if ((afterField.schema().name() != null
-                            && afterField.schema().name().equals("org.apache.kafka.connect.data.Timestamp"))) {
-                        afterSchemaBuilder.field(afterField.name(),
-                                Timestamp.builder().optional().defaultValue(null).build());
-                    } else if ((afterField.schema().name() != null
-                            && afterField.schema().name().equals("org.apache.kafka.connect.data.Date"))) {
-                        afterSchemaBuilder.field(afterField.name(),
-                                Date.builder().optional().defaultValue(null).build());
-                    } else {
-                        afterSchemaBuilder.field(afterField.name(), afterField.schema());
-                    }
-                }
-                builder.field(field.name(), afterSchemaBuilder.build());
+            if ((field.schema().name() != null
+                    && field.schema().name().equals("org.apache.kafka.connect.data.Timestamp"))) {
+                        builder.field(field.name(),
+                        Timestamp.builder().optional().defaultValue(null).build());
+            } else if ((field.schema().name() != null
+                    && field.schema().name().equals("org.apache.kafka.connect.data.Date"))) {
+                        builder.field(field.name(),
+                        Date.builder().optional().defaultValue(null).build());
             } else {
                 builder.field(field.name(), field.schema());
             }
-
         }
+        // Update the schema with the new fields
+        for (FieldReference fieldReference : additionalFields) {
+            builder = updateSchema(fieldReference, builder, originalRecordValue.schema());
+        }
+
         return builder.build();
     }
 
-    private SchemaBuilder updateSchema(FieldReference fieldReference, SchemaBuilder builder,
-            Schema originalRecordSchema) {
+    private SchemaBuilder updateSchema(FieldReference fieldReference, SchemaBuilder builder, Schema originalRecordSchema) {
         return builder.field(fieldReference.getNewField(), fieldReference.getSchema(originalRecordSchema));
     }
 
@@ -297,8 +318,7 @@ public class SetDataTypeToOptional<R extends ConnectRecord<R>> implements Transf
     private static class FieldReference {
 
         /**
-         * The struct ("source", "transaction") hosting the given field, or {@code null}
-         * for "op" and "ts_ms".
+         * The struct ("source", "transaction") hosting the given field, or {@code null} for "op" and "ts_ms".
          */
         private final String struct;
 
@@ -308,8 +328,7 @@ public class SetDataTypeToOptional<R extends ConnectRecord<R>> implements Transf
         private final String field;
 
         /**
-         * The name for the outgoing attribute/field, e.g. "__op" or "__source_ts_ms"
-         * when the prefix is "__"
+         * The name for the outgoing attribute/field, e.g. "__op" or "__source_ts_ms" when the prefix is "__"
          */
         private final String newField;
 
@@ -321,9 +340,11 @@ public class SetDataTypeToOptional<R extends ConnectRecord<R>> implements Transf
 
             if (parts.length == 1) {
                 this.newField = prefix + (splits.length == 1 ? this.field : this.struct + "_" + this.field);
-            } else if (parts.length == 2) {
+            }
+            else if (parts.length == 2) {
                 this.newField = prefix + parts[1];
-            } else {
+            }
+            else {
                 throw new IllegalArgumentException("Unexpected field name: " + field);
             }
         }
@@ -332,14 +353,15 @@ public class SetDataTypeToOptional<R extends ConnectRecord<R>> implements Transf
          * Determines the struct hosting the given unqualified field.
          */
         private static String determineStruct(String simpleFieldName) {
-            if (simpleFieldName.equals(Envelope.FieldName.OPERATION)
-                    || simpleFieldName.equals(Envelope.FieldName.TIMESTAMP)) {
+            if (simpleFieldName.equals(Envelope.FieldName.OPERATION) || simpleFieldName.equals(Envelope.FieldName.TIMESTAMP)) {
                 return null;
-            } else if (simpleFieldName.equals(TransactionMonitor.DEBEZIUM_TRANSACTION_ID_KEY) ||
+            }
+            else if (simpleFieldName.equals(TransactionMonitor.DEBEZIUM_TRANSACTION_ID_KEY) ||
                     simpleFieldName.equals(TransactionMonitor.DEBEZIUM_TRANSACTION_DATA_COLLECTION_ORDER_KEY) ||
                     simpleFieldName.equals(TransactionMonitor.DEBEZIUM_TRANSACTION_TOTAL_ORDER_KEY)) {
                 return Envelope.FieldName.TRANSACTION;
-            } else {
+            }
+            else {
                 return Envelope.FieldName.SOURCE;
             }
         }
@@ -347,7 +369,8 @@ public class SetDataTypeToOptional<R extends ConnectRecord<R>> implements Transf
         static List<FieldReference> fromConfiguration(String fieldPrefix, String addHeadersConfig) {
             if (Strings.isNullOrEmpty(addHeadersConfig)) {
                 return Collections.emptyList();
-            } else {
+            }
+            else {
                 return Arrays.stream(addHeadersConfig.split(","))
                         .map(String::trim)
                         .map(field -> new FieldReference(fieldPrefix, field))
@@ -360,10 +383,10 @@ public class SetDataTypeToOptional<R extends ConnectRecord<R>> implements Transf
         }
 
         Object getValue(Struct originalRecordValue) {
-            Struct parentStruct = struct != null ? (Struct) originalRecordValue.get(struct) : originalRecordValue;
+            Struct parentStruct = struct != null ? (Struct) originalRecordValue.getWithoutDefault(struct) : originalRecordValue;
 
             // transaction is optional; e.g. not present during snapshotting atm.
-            return parentStruct != null ? parentStruct.get(field) : null;
+            return parentStruct != null ? parentStruct.getWithoutDefault(field) : null;
         }
 
         Schema getSchema(Schema originalRecordSchema) {
